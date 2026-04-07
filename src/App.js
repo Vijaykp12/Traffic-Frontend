@@ -1,360 +1,212 @@
 import React, { useEffect, useState, useMemo } from "react";
-import { Map, Source, Layer } from "react-map-gl/maplibre";
-import maplibregl from "maplibre-gl";
 import axios from "axios";
-import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts';
-import { Marker } from "react-map-gl/maplibre";
-import "maplibre-gl/dist/maplibre-gl.css";
-
-const MAP_STYLE = "https://tiles.openfreemap.org/styles/dark";
+import Sidebar from "./components/Sidebar";
+import MapView from "./components/MapView";
+import DashboardStats from "./components/DashboardStats";
+import RouteInfo from "./components/RouteInfo";
+import { haversine, getEstimatedSpeed } from "./utils/helpers";
 
 function App() {
-  // Navigation & Data State
   const [activeTab, setActiveTab] = useState("dashboard");
   const [roads, setRoads] = useState(null);
   const [hour, setHour] = useState(18);
   const [roadPredictions, setRoadPredictions] = useState([]);
   const [cityStatus, setCityStatus] = useState("Low");
   const [weather, setWeather] = useState({ temperature: 19, windspeed: 10 });
-
-  // Routing State
   const [routeData, setRouteData] = useState({ coords: [], distance: 0, time: 0 });
   const [locations, setLocations] = useState({});
+  const [fromLoc, setFromLoc] = useState("");
+  const [toLoc, setToLoc] = useState("");
+  const [isAutoPlaying, setIsAutoPlaying] = useState(false);
+  const [isEmergencyMode, setIsEmergencyMode] = useState(false);
+
   useEffect(() => {
+    let interval;
+    if (isAutoPlaying) {
+      interval = setInterval(() => {
+        setHour(prev => (parseInt(prev) + 1) % 24);
+      }, 2000); // Changes every 2 seconds
+    }
+    return () => clearInterval(interval);
+  }, [isAutoPlaying]);
 
-    axios.get("http://localhost:5000/locations")
-      .then(res => {
-
-        const data = res.data;
-
-        setLocations(data);
-
-        const keys = Object.keys(data);
-
-        if (keys.length > 1) {
-          setFromLoc(keys[0]);
-          setToLoc(keys[1]);
-        }
-
-      });
-
-  }, []);
-  const [fromLoc, setFromLoc] = useState("T. Nagar");
-  const [toLoc, setToLoc] = useState("Adyar");
-
-  // Load Base Road Network
   useEffect(() => {
-    fetch("/export.geojson")
-      .then(res => res.json())
-      .then(data => setRoads(data));
+    axios.get("http://localhost:5000/locations").then(res => {
+      setLocations(res.data);
+      const keys = Object.keys(res.data);
+      if (keys.length > 1) { setFromLoc(keys[0]); setToLoc(keys[1]); }
+    });
+    fetch("/export.geojson").then(res => res.json()).then(data => setRoads(data));
   }, []);
 
-  // Sync with GNN Backend for Traffic Analysis
   useEffect(() => {
-    axios.post("http://localhost:5000/predict", { hour: parseInt(hour) })
-      .then((res) => {
-        setCityStatus(res.data.traffic);
-        setRoadPredictions(res.data.road_predictions);
-        setWeather(res.data.weather);
-      });
+    axios.post("http://localhost:5000/predict", { hour: parseInt(hour) }).then((res) => {
+      setCityStatus(res.data.traffic);
+      setRoadPredictions(res.data.road_predictions);
+      setWeather(res.data.weather);
+    });
   }, [hour]);
 
-  // Handle Traffic-Aware Routing
+  // App.js
+  useEffect(() => {
+    // If the user has already searched for a route, re-trace it when the hour changes
+    if (routeData.coords && routeData.coords.length > 0) {
+      handleFindRoute();
+    }
+  }, [hour]); // This dependency ensures the path recalculates every time you slide the clock
+
   const handleFindRoute = () => {
     axios.post("http://localhost:5000/route_by_name", {
       start_coords: locations[fromLoc],
       end_coords: locations[toLoc],
-      hour: hour
+      hour: parseInt(hour),
+      isEmergency: isEmergencyMode
     }).then(res => {
-      // Calculate travel stats based on path length and current city congestion
-      function haversine(a, b) {
-        const R = 6371; // km
-        const dLat = (b[1] - a[1]) * Math.PI / 180;
-        const dLon = (b[0] - a[0]) * Math.PI / 180;
+      const mainCoords = res.data.coordinates;
+      // Using optional chaining and fallback for the alternative path
+      const altCoords = res.data.alt_coordinates || [];
 
-        const lat1 = a[1] * Math.PI / 180;
-        const lat2 = b[1] * Math.PI / 180;
+      // 1. Calculate Distances
+      const calculateDist = (pts) => {
+        let d = 0;
+        for (let i = 0; i < pts.length - 1; i++) {
+          d += haversine(pts[i], pts[i + 1]);
+        }
+        return d;
+      };
 
-        const h =
-          Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-          Math.sin(dLon / 2) * Math.sin(dLon / 2) *
-          Math.cos(lat1) * Math.cos(lat2);
+      const mainDist = calculateDist(mainCoords);
+      const altDist = altCoords.length > 0 ? calculateDist(altCoords) : 0;
 
-        return 2 * R * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
-      }
+      // 2. Calculate Speeds & Times
+      // We assume the Main path is optimized by the GNN, 
+      // while the Alternative path faces standard congestion.
+      const speed = isEmergencyMode ? 60 : getEstimatedSpeed(cityStatus);
 
-      let dist = 0;
+      const mainTime = Math.round((mainDist / speed) * 60);
+      // Alt path is penalized by 20% speed to show it's less optimal
+      const altTime = altDist > 0 ? Math.round((altDist / (speed * 0.8)) * 60) : 0;
 
-      for (let i = 0; i < res.data.coordinates.length - 1; i++) {
-        dist += haversine(
-          res.data.coordinates[i],
-          res.data.coordinates[i + 1]
-        );
-      }
+      // 3. Update State with Path Array
+      setRouteData({
+        // 'coords' is kept for backward compatibility with your existing Marker logic
+        coords: mainCoords,
+        paths: [
+          { coords: mainCoords, time: mainTime, dist: mainDist.toFixed(2), type: 'main' },
+          { coords: altCoords, time: altTime, dist: altDist.toFixed(2), type: 'alt' }
+        ],
+        origin: mainCoords[0],
+        dest: mainCoords[mainCoords.length - 1],
+        distance: mainDist.toFixed(2),
+        time: mainTime,
+        isEmergency: isEmergencyMode
+      });
 
-      dist = dist.toFixed(2);
-
-      const speed =
-        cityStatus === "High" ? 18 :
-          cityStatus === "Medium" ? 30 :
-            45;
-
-      const time = Math.round((dist / speed) * 60);
-
-      setRouteData({ coords: res.data.coordinates, distance: dist, time: time });
-    }).catch(err => alert("Routing path obstructed. Try central nodes."));
+      console.log("Routing Success: Main and Alternative paths loaded.");
+    }).catch(err => {
+      console.error("Routing Error:", err);
+      alert("Could not find a valid route between these points.");
+    });
   };
 
-  // Memoized GeoJSON for Performance
   const routeGeoJSON = useMemo(() => {
-    if (!routeData.coords || routeData.coords.length === 0) return null;
-
-    const cleanCoords = routeData.coords.filter(
-      c => Array.isArray(c) &&
-        c.length === 2 &&
-        !isNaN(c[0]) &&
-        !isNaN(c[1])
-    );
-
-    return {
-      type: "Feature",
-      geometry: {
-        type: "LineString",
-        coordinates: cleanCoords
-      }
-    };
+    if (!routeData.coords?.length) return null;
+    return { type: "Feature", geometry: { type: "LineString", coordinates: routeData.coords } };
   }, [routeData.coords]);
 
   const geojsonWithData = useMemo(() => {
     if (!roads || !roadPredictions.length) return null;
-    return {
-      ...roads,
-      features: roads.features.map((f, i) => ({
-        ...f,
-        properties: { ...f.properties, trafficLevel: roadPredictions[i] || 0 }
-      }))
-    };
+    return { ...roads, features: roads.features.map((f, i) => ({ ...f, properties: { ...f.properties, trafficLevel: roadPredictions[i] || 0 } })) };
   }, [roads, roadPredictions]);
 
   return (
     <div style={{ display: "flex", backgroundColor: "#0b0e14", height: "100vh", color: "#fff", overflow: "hidden" }}>
-
-      {/* --- SIDEBAR --- */}
-      <div style={{ width: "280px", background: "#141821", padding: "40px 20px", borderRight: "1px solid #00f2ff22" }}>
-        <h2 style={{ color: "#00f2ff", letterSpacing: "4px", margin: 0 }}>DHVANI</h2>
-        <p style={{ fontSize: "0.5rem", color: "#444", marginBottom: "40px" }}>GNN TRAFFIC ENGINE v2.0</p>
-
-        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-          <button onClick={() => { setActiveTab("dashboard"); setRouteData({ coords: [], distance: 0, time: 0 }); }} style={tabStyle(activeTab === "dashboard")}>
-            DASHBOARD
-          </button>
-          <button onClick={() => setActiveTab("routing")} style={tabStyle(activeTab === "routing")}>
-            ROUTE FINDER
-          </button>
-        </div>
-
-        {activeTab === "routing" && (
-          <div style={{ marginTop: "40px", padding: "20px", background: "#0b0e14", borderRadius: "10px", border: "1px solid #00f2ff44" }}>
-            <p style={{ fontSize: "0.6rem", color: "#888", marginBottom: "5px" }}>ORIGIN</p>
-            <select value={fromLoc} onChange={e => setFromLoc(e.target.value)} style={selectStyle}>
-              {Object.keys(locations).map(k => <option key={k} value={k}>{k}</option>)}
-            </select>
-
-            <p style={{ fontSize: "0.6rem", color: "#888", marginTop: "15px", marginBottom: "5px" }}>DESTINATION</p>
-            <select value={toLoc} onChange={e => setToLoc(e.target.value)} style={selectStyle}>
-              {Object.keys(locations).map(k => <option key={k} value={k}>{k}</option>)}
-            </select>
-
-            <button onClick={handleFindRoute} style={btnStyle}>TRACE OPTIMAL ROUTE</button>
-          </div>
-        )}
-      </div>
-
-      {/* --- MAIN INTERFACE --- */}
+      <Sidebar
+        activeTab={activeTab} setActiveTab={setActiveTab} setRouteData={setRouteData}
+        locations={locations} fromLoc={fromLoc} setFromLoc={setFromLoc}
+        toLoc={toLoc} setToLoc={setToLoc} onTraceRoute={handleFindRoute} isEmergencyMode={isEmergencyMode}
+        setIsEmergencyMode={setIsEmergencyMode}
+      />
       <div style={{ flex: 1, display: "flex", flexDirection: "column", position: "relative" }}>
-
-        {/* MAP VIEW (3D ENABLED) */}
-        <div style={{ flex: 1, position: "relative" }}>
-          <Map
-            mapLib={maplibregl}
-            initialViewState={{ latitude: 13.0418, longitude: 80.2341, zoom: 12.5, pitch: 55, bearing: -15 }}
-            style={{ width: "100%", height: "100%" }}
-            mapStyle={MAP_STYLE}
-          >
-            {/* Layer 1: The Traffic Colors (Dashboard) */}
-            {activeTab === "dashboard" && geojsonWithData && (
-              <Source type="geojson" data={geojsonWithData}>
-                <Layer id="traffic" type="line" paint={{
-                  "line-color": ["match", ["get", "trafficLevel"], 2, "#ff0055", 1, "#00f2ff", "#39ff14"],
-                  "line-width": 2.5
-                }} />
-              </Source>
-            )}
-
-            {/* Layer 2: The Base Roads (Dull Background) */}
-            {roads && (
-              <Source type="geojson" data={roads}>
-                <Layer id="base-roads" type="line" paint={{
-                  "line-color": "#222",
-                  "line-width": 1,
-                  "line-opacity": activeTab === "routing" ? 0.1 : 0.4
-                }} />
-              </Source>
-            )}
-
-            {/* Layer 3: THE ROUTE (This MUST be last to stay on top) */}
-            {activeTab === "routing" && routeGeoJSON && (
-              <Source key={JSON.stringify(routeData.coords)} type="geojson" data={routeGeoJSON}>
-                <Layer
-                  id="route-glow"
-                  type="line"
-                  layout={{ "line-join": "round", "line-cap": "round" }}
-                  paint={{
-                    "line-color": "#ffffff",
-                    "line-width": 8,
-                    "line-blur": 1.5,
-                    "line-opacity": 0.8
-                  }}
-                />
-              </Source>
-            )}
-            {activeTab === "routing" && (
-              <>
-                {locations[fromLoc] && (
-                  <Marker longitude={locations[fromLoc][0]} latitude={locations[fromLoc][1]}>
-                    <div style={{ color: "#00f2ff", fontSize: "18px" }}>●</div>
-                  </Marker>
-                )}
-
-                {locations[toLoc] && (
-                  <Marker longitude={locations[toLoc][0]} latitude={locations[toLoc][1]}>
-                    <div style={{ color: "#ff0055", fontSize: "18px" }}>●</div>
-                  </Marker>
-                )}
-              </>
-            )}
-          </Map>
-          {/* ROUTE INFO OVERLAY */}
-          {activeTab === "routing" && routeData.coords.length > 0 && (
-            <div style={routeInfoCard}>
-              <h4 style={{ margin: 0, color: "#00f2ff", fontSize: "0.7rem", letterSpacing: "1px" }}>PATH_ACQUIRED</h4>
-              <h1 style={{ margin: "5px 0", fontSize: "2.5rem", color: "#39ff14", fontWeight: "300" }}>{routeData.time} MIN</h1>
-              <p style={{ margin: 0, fontSize: "0.8rem", color: "#888" }}>{routeData.distance} KM | {cityStatus.toUpperCase()} CONGESTION</p>
-            </div>
+        <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+          <MapView
+            activeTab={activeTab} roads={roads} geojsonWithData={geojsonWithData}
+            routeGeoJSON={routeGeoJSON} routeData={routeData}
+            locations={locations} fromLoc={fromLoc} toLoc={toLoc}
+          />
+          {/* Overlay logic stayed local for simplicity */}
+          {activeTab === "routing" && (
+            <RouteInfo routeData={routeData} cityStatus={cityStatus} />
           )}
 
-          {/* TIME SLIDER */}
           <div style={{ position: "absolute", bottom: 20, right: 20, background: "rgba(16, 18, 23, 0.9)", padding: "10px 20px", border: "1px solid #00f2ff", borderRadius: "8px", zIndex: 10 }}>
-            <input type="range" min="0" max="23" value={hour} onChange={(e) => setHour(e.target.value)} style={{ accentColor: "#00f2ff", width: "150px" }} />
-            <span style={{ marginLeft: "15px", fontFamily: "monospace", color: "#00f2ff" }}>{hour.toString().padStart(2, '0')}:00 HRS</span>
+            {/* TIME CONTROL CONSOLE */}
+            <div style={{
+              position: "absolute",
+              bottom: 20,
+              right: 20,
+              background: "rgba(16, 18, 23, 0.95)",
+              padding: "12px 20px",
+              border: "1px solid #00f2ff",
+              borderRadius: "10px",
+              zIndex: 20, // Ensure it's above markers
+              display: "flex",
+              alignItems: "center",
+              backdropFilter: "blur(10px)",
+              boxShadow: "0 4px 20px rgba(0, 242, 255, 0.2)"
+            }}>
+
+              {/* 1. THE PLAY/STOP BUTTON */}
+              <button
+                onClick={() => setIsAutoPlaying(!isAutoPlaying)}
+                style={{
+                  background: isAutoPlaying ? "#ff0055" : "#39ff14",
+                  color: "#000",
+                  border: "none",
+                  borderRadius: "4px",
+                  padding: "6px 12px",
+                  marginRight: "15px",
+                  cursor: "pointer",
+                  fontSize: "0.65rem",
+                  fontWeight: "900",
+                  letterSpacing: "1px",
+                  transition: "0.2s"
+                }}
+              >
+                {isAutoPlaying ? "STOP" : "PLAY 24H"}
+              </button>
+
+              {/* 2. THE MANUAL SLIDER */}
+              <input
+                type="range"
+                min="0"
+                max="23"
+                value={hour}
+                onChange={(e) => {
+                  setHour(e.target.value);
+                  setIsAutoPlaying(false); // Stop playing if user interacts manually
+                }}
+                style={{ accentColor: "#00f2ff", width: "140px", cursor: "pointer" }}
+              />
+
+              {/* 3. THE DIGITAL CLOCK */}
+              <span style={{
+                marginLeft: "15px",
+                fontFamily: "monospace",
+                color: "#00f2ff",
+                fontSize: "0.9rem",
+                minWidth: "60px",
+                textAlign: "right"
+              }}>
+                {hour.toString().padStart(2, '0')}:00
+              </span>
+            </div>            <span style={{ marginLeft: "15px", fontFamily: "monospace", color: "#00f2ff" }}>{hour.toString().padStart(2, '0')}:00 HRS</span>
           </div>
         </div>
-
-        {/* --- DASHBOARD STATS PANEL --- */}
-        {activeTab === "dashboard" && (
-          <div style={{ height: "250px", display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr", gap: "20px", padding: "20px", background: "#0b0e14", borderTop: "1px solid #333" }}>
-
-            {/* CARD 1: WEATHER */}
-            <div style={{ ...cardStyle, background: "linear-gradient(to bottom, #1a3c5a, #0b0e14)" }}>
-              <p style={{ fontSize: "0.7rem", color: "#00f2ff", letterSpacing: "1px", margin: 0 }}>METEO_SCAN</p>
-              <h1 style={{ margin: "10px 0", fontSize: "4.5rem", fontWeight: "200" }}>{weather.temperature}°C</h1>
-              <div style={{ display: "flex", gap: "15px", color: "#888", fontSize: "0.7rem" }}>
-                <span>WIND: {weather.windspeed} km/h</span>
-                <span>PRECIP: 0%</span>
-              </div>
-            </div>
-
-            {/* CARD 2: GNN WEIGHT PIE CHART */}
-            <div style={cardStyle}>
-              <h4 style={{ color: "#00f2ff", fontSize: "0.7rem", margin: "0 0 10px 0", letterSpacing: "1px" }}>GNN_WEIGHT_DIST</h4>
-              <ResponsiveContainer width="100%" height="80%">
-                <PieChart>
-                  <Pie data={[{ v: 45, n: "Spatial" }, { v: 35, n: "Temporal" }, { v: 20, n: "Weather" }]} dataKey="v" innerRadius={35} outerRadius={55} paddingAngle={5}>
-                    <Cell fill="#00f2ff" />
-                    <Cell fill="#ff0055" />
-                    <Cell fill="#39ff14" />
-                  </Pie>
-                  <Tooltip contentStyle={{ background: "#111", border: "none", fontSize: "10px" }} />
-                </PieChart>
-              </ResponsiveContainer>
-            </div>
-
-            {/* CARD 3: HOTSPOT/CITY LOAD */}
-            <div style={cardStyle}>
-              <h4 style={{ color: "#ff0055", fontSize: "0.7rem", margin: "0 0 10px 0", letterSpacing: "1px" }}>CITY_LOAD_STATUS</h4>
-              <h1 style={{ color: cityStatus === "High" ? "#ff0055" : cityStatus === "Medium" ? "#00f2ff" : "#39ff14", fontSize: "2.8rem", margin: "10px 0", fontWeight: "300" }}>
-                {cityStatus.toUpperCase()}
-              </h1>
-              <p style={{ fontSize: "0.7rem", color: "#444", margin: 0 }}>Processing 32,863 graph nodes...</p>
-            </div>
-
-          </div>
-        )}
+        {activeTab === "dashboard" && <DashboardStats weather={weather} cityStatus={cityStatus} />}
       </div>
     </div>
   );
 }
-
-// CSS-IN-JS STYLES
-const tabStyle = (a) => ({
-  background: a ? "#00f2ff22" : "transparent",
-  color: a ? "#00f2ff" : "#888",
-  border: "none",
-  borderLeft: a ? "4px solid #00f2ff" : "none",
-  padding: "15px",
-  textAlign: "left",
-  cursor: "pointer",
-  fontWeight: "bold",
-  width: "100%",
-  transition: "0.3s",
-  letterSpacing: "1px",
-  fontSize: "0.75rem"
-});
-
-const selectStyle = {
-  width: "100%",
-  background: "#1a1d24",
-  color: "#fff",
-  border: "1px solid #333",
-  padding: "10px",
-  marginTop: "5px",
-  fontSize: "0.8rem",
-  borderRadius: "4px"
-};
-
-const btnStyle = {
-  width: "100%",
-  padding: "12px",
-  background: "#00f2ff",
-  color: "#000",
-  border: "none",
-  fontWeight: "bold",
-  cursor: "pointer",
-  marginTop: "20px",
-  fontSize: "0.7rem",
-  borderRadius: "4px",
-  letterSpacing: "1px"
-};
-
-const cardStyle = {
-  background: "#141821",
-  borderRadius: "12px",
-  padding: "20px",
-  border: "1px solid #333",
-  boxShadow: "0 4px 15px rgba(0,0,0,0.5)"
-};
-
-const routeInfoCard = {
-  position: "absolute",
-  top: 25,
-  right: 25,
-  background: "rgba(10,12,16,0.95)",
-  padding: "20px",
-  borderRadius: "12px",
-  borderLeft: "5px solid #39ff14",
-  zIndex: 10,
-  backdropFilter: "blur(8px)",
-  boxShadow: "0 8px 32px rgba(0,0,0,0.8)"
-};
 
 export default App;
